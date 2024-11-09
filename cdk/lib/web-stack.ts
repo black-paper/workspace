@@ -1,47 +1,50 @@
-import { Duration, RemovalPolicy, Stack, StackProps } from "aws-cdk-lib";
+import {
+  aws_lambda,
+  Duration,
+  RemovalPolicy,
+  Stack,
+  StackProps,
+} from "aws-cdk-lib";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
-import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
 
-interface WebStackProps extends StackProps {
-  originRequestEdgeLambda: cloudfront.experimental.EdgeFunction;
-}
-
 export class WebStack extends Stack {
-  constructor(scope: Construct, id: string, props: WebStackProps) {
+  constructor(scope: Construct, id: string, props: StackProps) {
     super(scope, id, props);
 
-    // TODO: 403エラーが出る。DLのS3設定と比較してみる
+    const originRequestEdgeLambda = new cloudfront.experimental.EdgeFunction(
+      this,
+      "edge-origin-request",
+      {
+        code: aws_lambda.Code.fromAsset("/workspace/cdk/lambda/edge"),
+        functionName: "OriginRequestLambda",
+        handler: "rewrite-trailing-slash.handler",
+        runtime: aws_lambda.Runtime.PYTHON_3_12,
+        memorySize: 128,
+        timeout: Duration.seconds(5),
+      }
+    );
+
     const originBucket = new s3.Bucket(this, "OriginBucket", {
-      websiteIndexDocument: "index.html",
       removalPolicy: RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // バケットを非公開に設定
     });
 
-    const originAccessIdentify = new cloudfront.OriginAccessIdentity(
+    const originAccessIdentity = new cloudfront.OriginAccessIdentity(
       this,
-      "OriginAccessIdentify"
+      "OriginAccessIdentity"
     );
-    const originBucketPolicyStatement = new iam.PolicyStatement({
-      actions: ["s3:GetObject"],
-      effect: iam.Effect.ALLOW,
-      principals: [
-        new iam.CanonicalUserPrincipal(
-          originAccessIdentify.cloudFrontOriginAccessIdentityS3CanonicalUserId
-        ),
-      ],
-      resources: [`${originBucket.bucketArn}/*`],
-    });
-    originBucket.addToResourcePolicy(originBucketPolicyStatement);
+    originBucket.grantRead(originAccessIdentity); // CloudFrontからのアクセスを許可
 
     const distribution = new cloudfront.Distribution(this, "Distribution", {
       defaultRootObject: "index.html",
       defaultBehavior: {
-        origin: new origins.S3StaticWebsiteOrigin(originBucket, {
-          originAccessControlId: originAccessIdentify.originAccessIdentityId,
+        origin: new origins.S3Origin(originBucket, {
+          originAccessIdentity: originAccessIdentity,
         }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
@@ -50,18 +53,10 @@ export class WebStack extends Stack {
         edgeLambdas: [
           {
             eventType: cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
-            functionVersion: props.originRequestEdgeLambda.currentVersion,
+            functionVersion: originRequestEdgeLambda.currentVersion,
           },
         ],
       },
-      errorResponses: [
-        {
-          httpStatus: 403,
-          responseHttpStatus: 200,
-          responsePagePath: "/index.html",
-          ttl: Duration.minutes(5),
-        },
-      ],
     });
 
     new s3deploy.BucketDeployment(this, "Deploy", {
